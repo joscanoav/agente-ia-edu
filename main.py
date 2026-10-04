@@ -3,19 +3,20 @@
 Fuentes: arXiv (cs.CY, cs.AI), Google News RSS (2 consultas ES + 2 EN)
 y todos los feeds definidos en sources.yaml.
 
-Filtra los últimos 7 días, elimina duplicados y muestra por pantalla
-cuántos ítems salieron de cada fuente. Si una fuente falla, continúa.
+Filtra los últimos 7 días, elimina duplicados, aplica filtro de relevancia
+y genera un informe Markdown. Si una fuente falla, continúa.
 
-Este paso NO usa el LLM: solo recopila yNormaliza los datos.
+Este paso NO usa el LLM: solo recopila y normaliza los datos.
 """
 
 from __future__ import annotations
 
+import difflib
+import re
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import quote_plus
 
 import feedparser
 import requests
@@ -42,6 +43,35 @@ GOOGLE_NEWS_QUERIES = [
     ("es", "inteligencia artificial docentes"),
     ("en", "artificial intelligence education"),
     ("en", "AI teaching learning"),
+]
+
+# Términos para filtro de relevancia
+TERMINOS_IA = [
+    "AI",
+    "artificial intelligence",
+    "LLM",
+    "ChatGPT",
+    "generative",
+    "machine learning",
+    "inteligencia artificial",
+    "IA",
+]
+TERMINOS_EDU = [
+    "education",
+    "teaching",
+    "teacher",
+    "student",
+    "school",
+    "classroom",
+    "university",
+    "learning",
+    "educación",
+    "docente",
+    "profesor",
+    "alumno",
+    "escuela",
+    "aula",
+    "universidad",
 ]
 
 
@@ -84,6 +114,20 @@ def a_datetime(estructura) -> datetime | None:
         return datetime(*estructura[:6], tzinfo=timezone.utc)
     except (TypeError, ValueError):
         return None
+
+
+def limpiar_html(texto: str) -> str:
+    """Elimina etiquetas HTML de un texto."""
+    if not texto:
+        return ""
+    return re.sub(r"<[^>]+>", " ", texto).strip()
+
+
+def recortar_texto(texto: str, max_len: int = 300) -> str:
+    texto = limpiar_html(texto)
+    if len(texto) <= max_len:
+        return texto
+    return texto[:max_len].rstrip() + "..."
 
 
 def parsear_feed(contenido: bytes, fuente: str) -> list[Item]:
@@ -156,13 +200,13 @@ def obtener_google_news(session: requests.Session, idioma: str, consulta: str) -
     nombre = f"Google News [{idioma}] {consulta}"
     try:
         if idioma == "es":
-            params = {"q": consulta, "hl": "es", "gl": "ES", "ceid": "ES:es"}
+            params = {"hl": "es", "gl": "ES", "ceid": "ES:es"}
         else:
-            params = {"q": consulta, "hl": "en-US", "gl": "US", "ceid": "US:en"}
+            params = {"hl": "en-US", "gl": "US", "ceid": "US:en"}
         contenido = pedir(
             session,
-            f"https://news.google.com/rss/search?q={quote_plus(consulta)}",
-            params,
+            "https://news.google.com/rss/search",
+            params | {"q": consulta},
         )
         items = parsear_feed(contenido, nombre)
         if not items:
@@ -224,7 +268,7 @@ def recoger() -> tuple[list[Item], list[Resultado]]:
         resultados.append(res)
         print(f"  {res.fuente:<40} -> {res.total} items" + (f"  ({res.error})" if res.error else ""))
 
-    unicos: list[Item] = []
+    candidatos: list[Item] = []
     vistos: set[str] = set()
     for res in resultados:
         for item in res.items:
@@ -234,22 +278,152 @@ def recoger() -> tuple[list[Item], list[Resultado]]:
             if not clave or clave in vistos:
                 continue
             vistos.add(clave)
-            unicos.append(item)
+            candidatos.append(item)
+
+    print(f"  Tras ventana temporal (7d): {len(candidatos)} ítems")
+
+    # Filtro de relevancia (excepción: Google News ya filtrado por consulta)
+    relevantes: list[Item] = []
+    for item in candidatos:
+        fuente = item.fuente.lower()
+        es_google_news = "google news" in fuente
+        if es_google_news:
+            relevantes.append(item)
+            continue
+        texto = f"{item.titulo} {item.resumen}".lower()
+        tiene_ia = any(t.lower() in texto for t in TERMINOS_IA)
+        tiene_edu = any(t.lower() in texto for t in TERMINOS_EDU)
+        if tiene_ia and tiene_edu:
+            relevantes.append(item)
+    print(f"  Tras filtro de relevancia: {len(relevantes)} ítems")
+
+    # Dedupe por enlace y por título casi idéntico (ratio > 0.9)
+    unicos: list[Item] = []
+    vistos_urls: set[str] = set()
+    for item in relevantes:
+        url = (item.enlace or "").strip().lower()
+        if url and url in vistos_urls:
+            continue
+        # Comprobar título casi idéntico
+        es_duplicado = False
+        for existente in unicos:
+            ratio = difflib.SequenceMatcher(None, item.titulo.lower(), existente.titulo.lower()).ratio()
+            if ratio > 0.9:
+                es_duplicado = True
+                break
+        if es_duplicado:
+            continue
+        if url:
+            vistos_urls.add(url)
+        unicos.append(item)
+    print(f"  Tras dedupe (enlace + título ~0.9): {len(unicos)} ítems")
 
     unicos.sort(key=lambda i: i.fecha or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
     return unicos, resultados
 
 
-def resumen_consola(items: list[Item], resultados: list[Resultado]) -> None:
+def formatear_fecha(item: Item) -> str:
+    if item.fecha is None:
+        return "Sin fecha"
+    try:
+        return item.fecha.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return item.fecha.isoformat()
+
+
+def generar_informe(items: list[Item], ruta: Path | None = None) -> Path:
+    ruta = ruta or (OUTPUT_DIR / f"{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.md")
+    ruta.parent.mkdir(parents=True, exist_ok=True)
+
+    noticias: list[Item] = []
+    investigacion: list[Item] = []
+    videos: list[Item] = []
+
+    for item in items:
+        fuente = item.fuente.lower()
+        if "youtube" in fuente or "video" in fuente:
+            videos.append(item)
+        elif "arxiv" in fuente:
+            investigacion.append(item)
+        else:
+            noticias.append(item)
+
+    lineas: list[str] = []
+    lineas.append(f"# Informe de IA y Educación - {datetime.now(timezone.utc).strftime('%Y-%m-%d')}")
+    lineas.append("")
+
+    # Noticias
+    lineas.append("## Noticias")
+    lineas.append("")
+    if not noticias:
+        lineas.append("No hay ítems.")
+        lineas.append("")
+    else:
+        for item in noticias:
+            lineas.append(f"### {item.titulo}")
+            lineas.append(f"- Fuente: {item.fuente}")
+            lineas.append(f"- Fecha: {formatear_fecha(item)}")
+            resumen = recortar_texto(item.resumen, 300)
+            lineas.append(f"- Resumen: {resumen if resumen else 'Sin resumen'}")
+            lineas.append(f"- Enlace: {item.enlace}")
+            lineas.append("")
+
+    # Investigación (arXiv)
+    lineas.append("## Investigación (arXiv)")
+    lineas.append("")
+    if not investigacion:
+        lineas.append("No hay ítems.")
+        lineas.append("")
+    else:
+        for item in investigacion:
+            lineas.append(f"### {item.titulo}")
+            lineas.append(f"- Fuente: {item.fuente}")
+            lineas.append(f"- Fecha: {formatear_fecha(item)}")
+            resumen = recortar_texto(item.resumen, 300)
+            lineas.append(f"- Resumen: {resumen if resumen else 'Sin resumen'}")
+            lineas.append(f"- Enlace: {item.enlace}")
+            lineas.append("")
+
+    # Vídeos (categoría youtube)
+    lineas.append("## Vídeos (categoria youtube)")
+    lineas.append("")
+    if not videos:
+        lineas.append("No hay ítems.")
+        lineas.append("")
+    else:
+        for item in videos:
+            lineas.append(f"### {item.titulo}")
+            lineas.append(f"- Fuente: {item.fuente}")
+            lineas.append(f"- Fecha: {formatear_fecha(item)}")
+            resumen = recortar_texto(item.resumen, 300)
+            lineas.append(f"- Resumen: {resumen if resumen else 'Sin resumen'}")
+            lineas.append(f"- Enlace: {item.enlace}")
+            lineas.append("")
+
+    # URLs para NotebookLM
+    lineas.append("## Fuentes para NotebookLM")
+    lineas.append("")
+    for item in items:
+        url = item.enlace.strip()
+        if url:
+            lineas.append(f"- {url}")
+    lineas.append("")
+
+    ruta.write_text("\n".join(lineas), encoding="utf-8")
+    return ruta
+
+
+def resumen_consola_final(items: list[Item], resultados: list[Resultado], ruta_informe: Path | None = None) -> None:
     print("\n== Resumen ==")
     print(f"Fuentes consultadas : {len(resultados)}")
     fallos = [r for r in resultados if r.error]
     print(f"Fuentes con error  : {len(fallos)}")
     for r in fallos:
         print(f"  - {r.fuente}: {r.error}")
-    print(f"Items unicos (7d)  : {len(items)}")
     print(f"Total bruto         : {sum(r.total for r in resultados)}")
-    print("\n(No se genera informe todavia: esta version solo recoge datos.)")
+    print(f"Items finales       : {len(items)}")
+    if ruta_informe:
+        print(f"Ruta del archivo generado: {ruta_informe}")
 
 
 def main() -> int:
@@ -259,7 +433,8 @@ def main() -> int:
     except Exception as exc:  # noqa: BLE001
         print(f"Error fatal: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
-    resumen_consola(items, resultados)
+    ruta_informe = generar_informe(items)
+    resumen_consola_final(items, resultados, ruta_informe)
     return 0
 
 
