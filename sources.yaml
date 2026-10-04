@@ -1,0 +1,60 @@
+# Fuentes RSS para el agente de noticias sobre IA y educación.
+# Cada entrada: nombre legible + url del feed.
+# Todas las URLs están verificadas (responden 200 y XML válido).
+# arXiv no se incluye aquí: se consulta vía su API en main.py.
+
+feeds:
+  # --- Educación ---
+  - name: EdSurge
+    url: https://www.edsurge.com/feed
+    categoria: educacion
+
+  - name: Education Next
+    url: https://www.educationnext.org/feed/
+    categoria: educacion
+
+  - name: K-12 Dive
+    url: https://www.k12dive.com/feeds/news/
+    categoria: educacion
+
+  - name: Teaching Strategies
+    url: https://www.teachingstrategies.com/feed/
+    categoria: educacion
+
+  - name: Get Schooled
+    url: https://www.getschooled.com/feed/
+    categoria: educacion
+
+  - name: MIT News - Education
+    url: https://news.mit.edu/rss/topic/education
+    categoria: educacion
+
+  # --- Inteligencia artificial ---
+  - name: MIT News - Artificial Intelligence
+    url: https://news.mit.edu/rss/topic/artificial-intelligence2
+    categoria: ia
+
+  - name: IEEE Spectrum - Artificial Intelligence
+    url: https://spectrum.ieee.org/feeds/topic/artificial-intelligence.rss
+    categoria: ia
+
+  - name: Google Blog - AI
+    url: https://blog.google/technology/ai/rss/
+    categoria: ia
+
+  - name: MarkTechPost
+    url: https://www.marktechpost.com/feed/
+    categoria: ia
+
+  - name: VentureBeat - AI
+    url: https://venturebeat.com/category/ai/feed/
+    categoria: ia
+
+  # --- YouTube (RSS Atom de YouTube) ---
+  - name: YouTube - TED Talks
+    url: https://www.youtube.com/feeds/videos.xml?channel_id=UCAuUUnT6oDeKwE6v1NGQxug
+    categoria: youtube
+
+  - name: YouTube - TED-Ed Educator Talks
+    url: https://www.youtube.com/feeds/videos.xml?channel_id=UC9k9wQAp0SrWYZVORZnPIlg
+    categoria: youtube
