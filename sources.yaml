@@ -29,6 +29,57 @@ feeds:
     url: https://news.mit.edu/rss/topic/education
     categoria: educacion
 
+  # --- Medios directos de educación y tecnología educativa (verificados) ---
+  # En inglés:
+  - name: The 74
+    url: https://www.the74million.org/feed/
+    categoria: educacion
+
+  - name: Chalkbeat
+    url: https://www.chalkbeat.org/arc/outboundfeeds/rss/
+    categoria: educacion
+
+  - name: The Hechinger Report
+    url: https://hechingerreport.org/feed/
+    categoria: educacion
+
+  - name: eSchool News
+    url: https://www.eschoolnews.com/feed/
+    categoria: educacion
+
+  - name: Campus Technology
+    url: https://campustechnology.com/rss-feeds/all-articles.aspx
+    categoria: educacion
+
+  - name: Inside Higher Ed
+    url: https://www.insidehighered.com/rss.xml
+    categoria: educacion
+
+  - name: Tech & Learning
+    url: https://www.techlearning.com/rss
+    categoria: educacion
+
+  - name: UNESCO-UNEVOC
+    url: https://connect.unevoc.unesco.org/unevoc_news.xml
+    categoria: educacion
+
+  # En español:
+  - name: Educación 3.0
+    url: https://www.educaciontrespuntocero.com/feed/
+    categoria: educacion
+
+  - name: Magisterio
+    url: https://www.magisnet.com/feed/
+    categoria: educacion
+
+  - name: El Diario de la Educación
+    url: https://eldiariodelaeducacion.com/feed/
+    categoria: educacion
+
+  - name: Universidad Sí
+    url: https://www.universidadsi.es/feed/
+    categoria: educacion
+
   # --- Inteligencia artificial ---
   - name: MIT News - Artificial Intelligence
     url: https://news.mit.edu/rss/topic/artificial-intelligence2
@@ -51,10 +102,18 @@ feeds:
     categoria: ia
 
   # --- YouTube (RSS Atom de YouTube) ---
-  - name: YouTube - TED Talks
-    url: https://www.youtube.com/feeds/videos.xml?channel_id=UCAuUUnT6oDeKwE6v1NGQxug
+  - name: YouTube - DW Tecnología y mundo digital
+    url: https://www.youtube.com/feeds/videos.xml?channel_id=UCJicZ7CJGEwPtG4-mYYdZZQ
     categoria: youtube
 
-  - name: YouTube - TED-Ed Educator Talks
-    url: https://www.youtube.com/feeds/videos.xml?channel_id=UC9k9wQAp0SrWYZVORZnPIlg
+  - name: YouTube - Bilinkis
+    url: https://www.youtube.com/feeds/videos.xml?channel_id=UC5PwIMtLiIBCBhsu8f_-6UQ
+    categoria: youtube
+
+  - name: YouTube - Oppenheimer Presenta
+    url: https://www.youtube.com/feeds/videos.xml?channel_id=UCr_RmpEy7KbN-A2fFX6U_qQ
+    categoria: youtube
+
+  - name: YouTube - Platzi
+    url: https://www.youtube.com/feeds/videos.xml?channel_id=UC55-mxUj5Nj3niXFReG44OQ
     categoria: youtube

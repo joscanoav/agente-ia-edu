@@ -3,3 +3,7 @@ feedparser
 python-dotenv
 pyyaml
 groq
+trafilatura
+googlenewsdecoder
+selectolax<1.0
+tzdata
