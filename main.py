@@ -63,6 +63,10 @@ MAX_RESUMEN_PUNTUACION = 500
 TIMEOUT = 15
 ZONA = ZoneInfo("Europe/Madrid")
 
+# Reintentos de las peticiones HTTP ante 429 y 5xx.
+PEDIR_MAX_INTENTOS = 3
+PEDIR_ESPERA_BASE = 2.0
+
 # Paso de relevancia con Groq
 GROQ_MODEL_POR_DEFECTO = "openai/gpt-oss-120b"
 GROQ_LOTE = 15
@@ -332,9 +336,19 @@ def dentro_de_ventana(item: Item, limite: datetime) -> bool:
 
 
 def pedir(session: requests.Session, url: str, params: dict | None = None) -> bytes:
-    respuesta = session.get(url, params=params, timeout=TIMEOUT)
-    respuesta.raise_for_status()
-    return respuesta.content
+    """GET con reintentos y espera creciente ante errores 429 y 5xx."""
+    demora = PEDIR_ESPERA_BASE
+    for intento in range(1, PEDIR_MAX_INTENTOS + 1):
+        respuesta = session.get(url, params=params, timeout=TIMEOUT)
+        if (respuesta.status_code == 429 or respuesta.status_code >= 500) and (
+            intento < PEDIR_MAX_INTENTOS
+        ):
+            time.sleep(demora)
+            demora *= 2
+            continue
+        respuesta.raise_for_status()
+        return respuesta.content
+    raise RuntimeError("No se pudo completar la petición")  # pragma: no cover
 
 
 def contar_coincidencias(texto: str) -> tuple[int, int]:
@@ -1000,6 +1014,7 @@ def resumen_consola_final(
         print(f"Informe principal       : {ruta_principal}")
     if ruta_titulares:
         print(f"Informe de titulares    : {ruta_titulares}")
+    print(f"Ítems con texto real    : {con_texto}")
 
 
 def main() -> int:
