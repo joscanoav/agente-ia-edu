@@ -7,3 +7,4 @@ trafilatura
 googlenewsdecoder
 selectolax<1.0
 tzdata
+pypdf
