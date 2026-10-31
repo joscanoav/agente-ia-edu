@@ -9,6 +9,7 @@ import io
 import json
 import os
 import re
+import time
 import unicodedata
 from dataclasses import dataclass
 from typing import Any
@@ -42,6 +43,11 @@ GROQ_MODEL_POR_DEFECTO = "openai/gpt-oss-120b"
 MAX_CARACTERES_FUENTE = 8000  # Límite de texto de fuente enviado al modelo
 MAX_LLAMADAS_HERRAMIENTA_POR_AFIRMACION = 5
 UMBRAL_TEXTO_UTIL = 100  # Mínimo de caracteres para considerar útil un texto extraído
+
+# Reintentos ante 429 (rate limit) y espera máxima aceptada del propio error.
+MAX_REINTENTOS_RATE_LIMIT = 3
+MAX_ESPERA_RATE_LIMIT = 120.0
+ESPERA_RATE_LIMIT_POR_DEFECTO = 2.0
 
 DOMINIOS_FUENTE_PRIMARIA_CONFIANZA = (
     "ugr.es",
@@ -162,6 +168,92 @@ def sesion_http() -> requests.Session:
     s = requests.Session()
     s.headers.update({"User-Agent": USER_AGENT})
     return s
+
+
+def _segundos_espera_rate_limit(error: Exception) -> float:
+    """Lee el tiempo de espera que indica el error 429 (cabecera o mensaje)."""
+    respuesta = getattr(error, "response", None)
+    cabeceras = getattr(respuesta, "headers", None)
+    if cabeceras is not None:
+        try:
+            valor = cabeceras.get("retry-after")
+        except Exception:
+            valor = None
+        if valor:
+            try:
+                return max(
+                    0.0, min(MAX_ESPERA_RATE_LIMIT, float(str(valor).strip()))
+                )
+            except (TypeError, ValueError):
+                pass
+
+    texto = str(error)
+    patrones = (
+        r"retry[- ]after[^\d]{0,20}(\d+(?:[.,]\d+)?)\s*(ms|s|m)?",
+        r"(?:try again|intenta(?:r)? de nuevo|reintenta)[^\d]{0,40}"
+        r"(\d+(?:[.,]\d+)?)\s*(ms|s|m)?",
+        r"(?:in|en)\s+(\d+(?:[.,]\d+)?)\s*(ms|s|segundos?|m|minutos?)",
+    )
+    for patron in patrones:
+        coincidencia = re.search(patron, texto, re.IGNORECASE)
+        if not coincidencia:
+            continue
+        try:
+            cantidad = float(coincidencia.group(1).replace(",", "."))
+        except ValueError:
+            continue
+        unidad = (coincidencia.group(2) or "s").lower()
+        if unidad == "ms":
+            cantidad /= 1000.0
+        elif unidad in ("m", "minuto", "minutos"):
+            cantidad *= 60.0
+        return max(0.0, min(MAX_ESPERA_RATE_LIMIT, cantidad))
+    return ESPERA_RATE_LIMIT_POR_DEFECTO
+
+
+def _llamar_groq_json(
+    cliente,
+    modelo: str,
+    system_prompt: str,
+    user_prompt: str,
+    resultado: dict[str, Any],
+    contexto: str,
+) -> tuple[dict[str, Any] | None, bool]:
+    """Llama a Groq y reintenta solo los 429 hasta MAX_REINTENTOS_RATE_LIMIT.
+
+    Devuelve (datos_json, se_agoto_el_limite). No relaja ninguna validación.
+    """
+    for intento in range(MAX_REINTENTOS_RATE_LIMIT + 1):
+        try:
+            resp = cliente.chat.completions.create(
+                model=modelo,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                temperature=0,
+                response_format={"type": "json_object"},
+            )
+            contenido_resp = resp.choices[0].message.content or "{}"
+            return json.loads(contenido_resp), False
+        except RateLimitError as e:
+            if intento >= MAX_REINTENTOS_RATE_LIMIT:
+                resultado["limite_api"] = True
+                resultado["errores"].append(
+                    f"RateLimitError {contexto} tras "
+                    f"{MAX_REINTENTOS_RATE_LIMIT + 1} intentos: {e}"
+                )
+                return None, True
+            espera = _segundos_espera_rate_limit(e)
+            resultado["errores"].append(
+                f"RateLimitError {contexto}; esperando {espera:.1f}s y "
+                f"reintentando ({intento + 1}/{MAX_REINTENTOS_RATE_LIMIT})"
+            )
+            time.sleep(espera)
+        except Exception as e:
+            resultado["errores"].append(f"Error {contexto}: {e}")
+            return None, False
+    return None, False
 
 
 def config_groq_verificador() -> tuple[str, str, bool]:
@@ -394,6 +486,89 @@ def descargar_texto_con_enlaces(html: str) -> str:
         return ""
 
 
+_ABREVIATURAS_FIN_FRASE = {
+    "abr",
+    "ago",
+    "aprox",
+    "art",
+    "av",
+    "cap",
+    "cf",
+    "d",
+    "dic",
+    "dr",
+    "dra",
+    "ej",
+    "ene",
+    "etc",
+    "feb",
+    "fig",
+    "figs",
+    "jul",
+    "jun",
+    "mar",
+    "may",
+    "mr",
+    "mrs",
+    "ms",
+    "no",
+    "nov",
+    "num",
+    "oct",
+    "p",
+    "pp",
+    "sept",
+    "sep",
+    "sr",
+    "sra",
+    "srta",
+    "st",
+    "tel",
+    "ud",
+    "uds",
+    "vds",
+    "vol",
+    "vs",
+}
+
+
+def _termina_en_abreviatura(fragmento: str) -> bool:
+    texto = (fragmento or "").rstrip().strip("\"'”’»")
+    if not texto.endswith("."):
+        return False
+    if re.search(r"(?:\b[a-záéíóúüñ]\.){2,}$", texto, re.IGNORECASE):
+        return True
+    coincidencia = re.search(r"([a-záéíóúüñ]+)\.$", texto, re.IGNORECASE)
+    if coincidencia:
+        return coincidencia.group(1).lower() in _ABREVIATURAS_FIN_FRASE
+    return bool(re.search(r"\b[a-záéíóúüñ]\.$", texto, re.IGNORECASE))
+
+
+def _dividir_frases(texto: str) -> list[str]:
+    """Divide en frases sin cortar tras abreviaturas como Oct., U.S. o Dr."""
+    if not texto:
+        return []
+    partes = re.split(r"(?<=[.!?])\s+", texto)
+    frases: list[str] = []
+    for parte in partes:
+        if frases and _termina_en_abreviatura(frases[-1]):
+            frases[-1] = frases[-1].rstrip() + " " + parte.lstrip()
+        else:
+            frases.append(parte)
+    return frases
+
+
+def _ultimo_fin_frase(texto: str) -> int | None:
+    ultimo: int | None = None
+    for coincidencia in re.finditer(r"[.!?](?=\s|$)", texto):
+        if coincidencia.group() == "." and _termina_en_abreviatura(
+            texto[: coincidencia.end()]
+        ):
+            continue
+        ultimo = coincidencia.end()
+    return ultimo
+
+
 def _seleccionar_fragmentos_relevantes(texto_fuente: str, afirmacion: str) -> str:
     if not texto_fuente:
         return ""
@@ -403,7 +578,7 @@ def _seleccionar_fragmentos_relevantes(texto_fuente: str, afirmacion: str) -> st
     palabras = re.findall(r"\b\w{4,}\b", afirmacion.lower())
     if not palabras:
         return recortar_fuente(texto_fuente)
-    oraciones = re.split(r"(?<=[.!?])\s+", texto_fuente)
+    oraciones = _dividir_frases(texto_fuente)
     puntuadas = []
     for s in oraciones:
         sl = s.lower()
@@ -425,9 +600,7 @@ def recortar_fuente(texto: str) -> str:
     if len(texto) <= MAX_CARACTERES_FUENTE:
         return texto
     fragmento = texto[:MAX_CARACTERES_FUENTE]
-    ultimo = None
-    for m in re.finditer(r"[.!?](?=\s|$)", fragmento):
-        ultimo = m.end()
+    ultimo = _ultimo_fin_frase(fragmento)
     if ultimo:
         return fragmento[:ultimo].strip()
     return fragmento.strip()
@@ -478,6 +651,16 @@ def _resolver_fuente_item(
             return "", tipo
         return _texto_de_recurso(datos, tipo, content_type), tipo
 
+    def usar_abstract() -> tuple[str, str, str]:
+        if abstract and _texto_util(abstract):
+            cobertura = (
+                "solo_abstract"
+                if getattr(item, "solo_titular", False)
+                else "texto_completo"
+            )
+            return url_item, abstract, cobertura
+        return "", "", "sin_fuente"
+
     if es_arxiv_item:
         arxiv_id = _extraer_id_arxiv(url_item)
         if arxiv_id:
@@ -527,17 +710,23 @@ def _resolver_fuente_item(
     if not url_item:
         return "", "", "sin_fuente"
 
+    texto_item = (getattr(item, "texto", "") or "").strip()
+    if _texto_util(texto_item):
+        return url_item, texto_item, "texto_completo"
+    if abstract and _texto_util(abstract):
+        return url_item, abstract, "solo_abstract"
+
     datos_item, tipo_item, content_type_item = descargar(url_item)
     if datos_item is None:
         if tipo_item.startswith("error:"):
             resultado["errores"].append(f"Error descargando {url_item}: {tipo_item}")
-        return "", "", "sin_fuente"
+        return usar_abstract()
     if tipo_item == "pdf" or datos_item[:4] == b"%PDF":
-        return "", "", "sin_fuente"
+        return usar_abstract()
 
     html_item = _bytes_a_texto(datos_item, content_type_item)
     if not html_item:
-        return "", "", "sin_fuente"
+        return usar_abstract()
 
     enlaces = extraer_enlaces_html(html_item, base_url=url_item)
     candidatos: list[str] = []
@@ -551,7 +740,8 @@ def _resolver_fuente_item(
                 "intef.es",
                 "unesco.org",
                 "oecd.org",
-                "revistas",
+                "/revistas/",
+                "revistas.",
                 "doi.org",
             ]
         ):
@@ -568,7 +758,7 @@ def _resolver_fuente_item(
         if _texto_util(texto, 100):
             return cand, texto, "texto_completo"
 
-    return "", "", "sin_fuente"
+    return usar_abstract()
 
 
 def _es_afirmacion_autosuficiente(texto: str) -> bool:
@@ -605,32 +795,27 @@ def _extraer_afirmaciones_groq(item, cliente, modelo: str, resultado: dict[str, 
         "Devuelve ÚNICAMENTE un JSON con la clave \"afirmaciones\" como lista de strings.\n\n"
         f"Texto:\n{contenido[:4000]}"
     )
-    try:
-        resp = cliente.chat.completions.create(
-            model=modelo,
-            messages=[
-                {"role": "system", "content": "Eres un extractor estricto que escribe siempre en español. Respondes solo con JSON válido."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0,
-            response_format={"type": "json_object"},
-        )
-        contenido_resp = resp.choices[0].message.content or "{}"
-        datos = json.loads(contenido_resp)
-        afirmaciones = datos.get("afirmaciones") or []
-        res = []
-        for a in afirmaciones:
-            if isinstance(a, str) and a.strip():
-                a = a.strip()
-                if _es_afirmacion_autosuficiente(a):
-                    res.append(a)
-        return res[:3]
-    except RateLimitError as e:
-        resultado["errores"].append(f"RateLimitError extrayendo afirmaciones: {e}")
+    datos, limite = _llamar_groq_json(
+        cliente,
+        modelo,
+        "Eres un extractor estricto que escribe siempre en español. "
+        "Respondes solo con JSON válido.",
+        prompt,
+        resultado,
+        "extrayendo afirmaciones",
+    )
+    if limite:
+        resultado["limite_api"] = True
+    if not isinstance(datos, dict):
         return []
-    except Exception as e:
-        resultado["errores"].append(f"Error extrayendo afirmaciones: {e}")
-        return []
+    afirmaciones = datos.get("afirmaciones") or []
+    res = []
+    for a in afirmaciones:
+        if isinstance(a, str) and a.strip():
+            a = a.strip()
+            if _es_afirmacion_autosuficiente(a):
+                res.append(a)
+    return res[:3]
 
 
 def _extraer_fragmentos_entre_comillas(evidencia: str) -> list[str] | None:
@@ -677,22 +862,197 @@ def _validar_evidencia_en_fuente(evidencia: str, texto_fuente: str) -> bool:
     return True
 
 
+_UNIDADES_NUMERO = {
+    "cero": 0,
+    "un": 1,
+    "uno": 1,
+    "una": 1,
+    "dos": 2,
+    "tres": 3,
+    "cuatro": 4,
+    "cinco": 5,
+    "seis": 6,
+    "siete": 7,
+    "ocho": 8,
+    "nueve": 9,
+    "diez": 10,
+    "once": 11,
+    "doce": 12,
+    "trece": 13,
+    "catorce": 14,
+    "quince": 15,
+    "dieciseis": 16,
+    "diecisiete": 17,
+    "dieciocho": 18,
+    "diecinueve": 19,
+    "veinte": 20,
+    "veintiuno": 21,
+    "veintiun": 21,
+    "veintiuna": 21,
+    "veintidos": 22,
+    "veintitres": 23,
+    "veinticuatro": 24,
+    "veinticinco": 25,
+    "veintiseis": 26,
+    "veintisiete": 27,
+    "veintiocho": 28,
+    "veintinueve": 29,
+    "treinta": 30,
+    "cuarenta": 40,
+    "cincuenta": 50,
+    "sesenta": 60,
+    "setenta": 70,
+    "ochenta": 80,
+    "noventa": 90,
+}
+
+_CENTENAS_NUMERO = {
+    "cien": 100,
+    "ciento": 100,
+    "doscientos": 200,
+    "doscientas": 200,
+    "trescientos": 300,
+    "trescientas": 300,
+    "cuatrocientos": 400,
+    "cuatrocientas": 400,
+    "quinientos": 500,
+    "quinientas": 500,
+    "seiscientos": 600,
+    "seiscientas": 600,
+    "setecientos": 700,
+    "setecientas": 700,
+    "ochocientos": 800,
+    "ochocientas": 800,
+    "novecientos": 900,
+    "novecientas": 900,
+}
+
+_ESCALAS_MILLON = {
+    "millon": 1_000_000,
+    "millones": 1_000_000,
+    "millardo": 1_000_000_000,
+    "millardos": 1_000_000_000,
+    "billon": 1_000_000_000_000,
+    "billones": 1_000_000_000_000,
+}
+
+_PALABRAS_NUMERO = (
+    set(_UNIDADES_NUMERO) | set(_CENTENAS_NUMERO) | set(_ESCALAS_MILLON) | {"mil"}
+)
+
+
+def _unir_miles_con_espacios(texto: str) -> str:
+    """Une grupos de miles separados por espacios: '3 000' -> '3000'."""
+    patron = re.compile(
+        r"(?<!\d)(\d{1,3}(?:[ \u00a0\u202f]\d{3})+)(?!\d)"
+    )
+    return patron.sub(
+        lambda m: re.sub(r"[ \u00a0\u202f]", "", m.group(1)), texto
+    )
+
+
 def _normalizar_numero(numero: str) -> str:
-    n = (numero or "").strip()
+    n = (numero or "").strip().replace(" ", "")
+    if not n:
+        return ""
     if re.fullmatch(r"\d{1,3}(?:[.,]\d{3})+", n):
-        n = re.sub(r"[.,]", "", n)
-    else:
+        return re.sub(r"[.,]", "", n)
+    if "," in n and "." in n:
+        if n.rfind(",") > n.rfind("."):
+            n = n.replace(".", "").replace(",", ".")
+        else:
+            n = n.replace(",", "")
+    elif "," in n:
         n = n.replace(",", ".")
-        if "." in n:
-            n = n.rstrip("0").rstrip(".")
+    if "." in n:
+        n = n.rstrip("0").rstrip(".")
     return n
+
+
+def _quitar_acentos(texto: str) -> str:
+    normalizado = unicodedata.normalize("NFKD", texto)
+    return "".join(c for c in normalizado if not unicodedata.combining(c))
+
+
+def _convertir_palabras_numero(tokens: list[str]) -> int:
+    total = 0
+    actual = 0
+    for token in tokens:
+        if token == "y":
+            continue
+        if token in _UNIDADES_NUMERO:
+            actual += _UNIDADES_NUMERO[token]
+        elif token in _CENTENAS_NUMERO:
+            actual += _CENTENAS_NUMERO[token]
+        elif token == "mil":
+            actual = actual or 1
+            total += actual * 1000
+            actual = 0
+        elif token in _ESCALAS_MILLON:
+            escala = _ESCALAS_MILLON[token]
+            if actual:
+                total = (total + actual) * escala
+            elif total:
+                total *= escala
+            else:
+                total = escala
+            actual = 0
+    return total + actual
+
+
+def _numeros_en_palabras(texto: str) -> set[str]:
+    """Extrae cifras escritas en letras ('doscientos mil' -> '200000')."""
+    tokens = re.findall(r"[a-z]+", _quitar_acentos((texto or "").lower()))
+    resultado: set[str] = set()
+    i = 0
+    while i < len(tokens):
+        if tokens[i] not in _PALABRAS_NUMERO:
+            i += 1
+            continue
+        secuencia: list[str] = []
+        while i < len(tokens):
+            token = tokens[i]
+            if token in _PALABRAS_NUMERO:
+                secuencia.append(token)
+                i += 1
+            elif (
+                token == "y"
+                and secuencia
+                and i + 1 < len(tokens)
+                and tokens[i + 1] in _PALABRAS_NUMERO
+            ):
+                secuencia.append(token)
+                i += 1
+            else:
+                break
+        while secuencia and secuencia[0] == "y":
+            secuencia.pop(0)
+        while secuencia and secuencia[-1] == "y":
+            secuencia.pop()
+        if not secuencia:
+            continue
+        if (
+            len(secuencia) == 1
+            and secuencia[0] in _UNIDADES_NUMERO
+            and _UNIDADES_NUMERO[secuencia[0]] < 10
+        ):
+            continue
+        valor = _convertir_palabras_numero(secuencia)
+        if valor > 0:
+            resultado.add(str(valor))
+    return resultado
 
 
 def _numeros_de_texto(texto: str) -> set[str]:
     if not texto:
         return set()
-    encontrados = re.findall(r"(?<!\d)\d(?:[\d.,]*\d)?(?!\d)", texto)
-    return {_normalizar_numero(n) for n in encontrados if n}
+    texto_unido = _unir_miles_con_espacios(texto)
+    encontrados = re.findall(
+        r"(?<!\d)\d(?:[\d.,]*\d)?(?!\d)", texto_unido
+    )
+    numeros = {_normalizar_numero(n) for n in encontrados if n}
+    numeros |= _numeros_en_palabras(texto)
+    return {n for n in numeros if n}
 
 
 def _validar_matices(
@@ -750,7 +1110,7 @@ def _comparar_afirmacion_groq(
     cliente,
     modelo: str,
     resultado: dict[str, Any],
-) -> dict[str, Any] | None:
+) -> tuple[dict[str, Any] | None, bool]:
     prompt = (
         "Compara la AFIRMACIÓN con la FUENTE PRIMARIA. "
         "Responde ÚNICAMENTE con JSON válido con estas claves EXACTAS:\n"
@@ -785,31 +1145,63 @@ def _comparar_afirmacion_groq(
         f"FUENTE_PRIMARIA_URL:\n{fuente_url}\n\n"
         f"CONTENIDO_FUENTE:\n{texto_fuente}\n"
     )
-    for intento in range(2):  # reintento si falla JSON
-        try:
-            resp = cliente.chat.completions.create(
-                model=modelo,
-                messages=[
-                    {"role": "system", "content": "Eres un verificador estricto. Solo usas la fuente proporcionada. Escribes en español. Respondes solo JSON válido."},
-                    {"role": "user", "content": prompt},
-                ],
-                temperature=0,
-                response_format={"type": "json_object"},
-            )
-            contenido_resp = resp.choices[0].message.content or "{}"
-            datos = json.loads(contenido_resp)
-            return datos
-        except RateLimitError as e:
-            resultado["errores"].append(f"RateLimitError comparando afirmación: {e}")
-            if intento == 1:
-                return None
-            continue
-        except Exception as e:
-            resultado["errores"].append(f"Error comparando afirmación: {e}")
-            if intento == 1:
-                return None
-            continue
-    return None
+    datos, limite = _llamar_groq_json(
+        cliente,
+        modelo,
+        "Eres un verificador estricto. Solo usas la fuente proporcionada. "
+        "Escribes en español. Respondes solo JSON válido.",
+        prompt,
+        resultado,
+        "comparando afirmación",
+    )
+    if limite:
+        resultado["limite_api"] = True
+    return (datos if isinstance(datos, dict) else None), limite
+
+
+def _pedir_evidencia_mas_larga(
+    afirmacion: str,
+    texto_fuente: str,
+    fuente_url: str,
+    evidencia_actual: str,
+    faltantes: set[str],
+    cliente,
+    modelo: str,
+    resultado: dict[str, Any],
+) -> tuple[str | None, bool]:
+    """Pide una única cita más larga cuando la anterior no cubre las cifras."""
+    prompt = (
+        "La cita de evidencia propuesta es demasiado corta y no contiene todas "
+        "las cifras de la afirmación. Devuelve ÚNICAMENTE un JSON con la clave "
+        "EXACTA 'evidencia', cuyo valor sea una CITA LITERAL y CONTINUA copiada "
+        "exactamente del CONTENIDO_FUENTE. La cita debe ser lo más larga posible "
+        "y debe incluir TODAS estas cifras de la afirmación: "
+        f"{', '.join(sorted(faltantes))}. No parafrasees, no omitas palabras "
+        "intermedias y no unas pasajes separados con conectores. Si no existe "
+        "una cita literal que cubra esas cifras, devuelve una cadena vacía.\n\n"
+        f"AFIRMACIÓN:\n{afirmacion}\n\n"
+        f"FUENTE_PRIMARIA_URL:\n{fuente_url}\n\n"
+        f"EVIDENCIA_ACTUAL:\n{evidencia_actual}\n\n"
+        f"CONTENIDO_FUENTE:\n{texto_fuente}\n"
+    )
+    datos, limite = _llamar_groq_json(
+        cliente,
+        modelo,
+        "Eres un verificador estricto. Copias citas literales de la fuente. "
+        "Escribes en español. Respondes solo JSON válido.",
+        prompt,
+        resultado,
+        "ampliando evidencia",
+    )
+    if limite:
+        resultado["limite_api"] = True
+        return None, True
+    if not isinstance(datos, dict):
+        return None, False
+    evidencia = datos.get("evidencia") or ""
+    if not isinstance(evidencia, str):
+        return None, False
+    return evidencia.strip(), False
 
 
 def _resultado_no_verificado(
@@ -836,6 +1228,32 @@ def _resultado_no_verificado(
     res["motivo_rechazo"] = (
         motivo or "No se pudo validar el veredicto con la evidencia disponible."
     )
+    return res
+
+
+def _resultado_limite_api(
+    afirmacion: str,
+    fuente_url: str = "",
+    cobertura: str = "",
+    datos_cmp: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    res = {
+        "texto": afirmacion,
+        "tipo": (datos_cmp.get("tipo") if isinstance(datos_cmp, dict) else None) or "otro",
+        "fidelidad": "no verificable (límite de la API)",
+        "respaldo": "limite_api",
+        "fuente_primaria_url": fuente_url,
+        "evidencia": "",
+        "matices_omitidos": [],
+        "confianza": 0.0,
+        "revisado_humano": False,
+        "fuente_cobertura": cobertura,
+        "motivo_rechazo": (
+            "No se pudo verificar: la API alcanzó su límite de peticiones (429)."
+        ),
+    }
+    if datos_cmp is not None:
+        res["veredicto_modelo_sin_validar"] = datos_cmp
     return res
 
 
@@ -908,7 +1326,7 @@ def verificar_item(item) -> dict[str, Any]:
         return resultado
 
     if not afirmaciones:
-        if not resultado["errores"]:
+        if not resultado.get("limite_api") and not resultado["errores"]:
             resultado["errores"].append("No se extrajeron afirmaciones comprobables")
         return resultado
 
@@ -937,6 +1355,7 @@ def verificar_item(item) -> dict[str, Any]:
 
     for afirmacion in afirmaciones:
         llamadas_afirmacion = 0
+        limite_api_afirmacion = False
 
         # Comparar con modelo - contar llamadas por afirmación
         try:
@@ -954,7 +1373,7 @@ def verificar_item(item) -> dict[str, Any]:
             texto_fuente_seleccionado = _seleccionar_fragmentos_relevantes(
                 texto_fuente, afirmacion
             )
-            datos_cmp = _comparar_afirmacion_groq(
+            datos_cmp, limite_api_afirmacion = _comparar_afirmacion_groq(
                 afirmacion,
                 texto_fuente_seleccionado,
                 fuente_url_elegida,
@@ -964,10 +1383,22 @@ def verificar_item(item) -> dict[str, Any]:
             )
         except RateLimitError as e:
             resultado["errores"].append(f"RateLimitError comparando afirmación: {e}")
+            limite_api_afirmacion = True
             datos_cmp = None
         except Exception as e:
             resultado["errores"].append(f"Error comparando afirmación: {e}")
             datos_cmp = None
+
+        if limite_api_afirmacion:
+            resultado["afirmaciones"].append(
+                _resultado_limite_api(
+                    afirmacion,
+                    fuente_url_elegida,
+                    cobertura,
+                    datos_cmp,
+                )
+            )
+            continue
 
         if not isinstance(datos_cmp, dict) or not datos_cmp:
             resultado["afirmaciones"].append(
@@ -996,11 +1427,64 @@ def verificar_item(item) -> dict[str, Any]:
         elif respaldo_norm == "respaldado":
             faltan = _numeros_de_texto(afirmacion) - _numeros_de_texto(evidencia_limpia)
             if faltan:
-                motivo_rechazo = (
-                    "La evidencia no contiene todas las cifras de la afirmación: "
-                    + ", ".join(sorted(faltan))
-                    + "."
-                )
+                # Una sola petición adicional de una cita más larga.
+                if llamadas_afirmacion < MAX_LLAMADAS_HERRAMIENTA_POR_AFIRMACION:
+                    llamadas_afirmacion += 1
+                    nueva_evidencia, limite_api_afirmacion = (
+                        _pedir_evidencia_mas_larga(
+                            afirmacion,
+                            texto_fuente_seleccionado,
+                            fuente_url_elegida,
+                            evidencia,
+                            faltan,
+                            cliente,
+                            modelo_verif,
+                            resultado,
+                        )
+                    )
+                    if limite_api_afirmacion:
+                        resultado["afirmaciones"].append(
+                            _resultado_limite_api(
+                                afirmacion,
+                                fuente_url_elegida,
+                                cobertura,
+                                datos_cmp,
+                            )
+                        )
+                        continue
+                    if nueva_evidencia:
+                        evidencia = nueva_evidencia
+                        evidencia_limpia = _limpiar_evidencia(evidencia)
+                        if not _validar_evidencia_en_fuente(
+                            evidencia, texto_fuente
+                        ):
+                            motivo_rechazo = (
+                                "La evidencia ampliada no es una cita literal "
+                                "de la fuente."
+                            )
+                        else:
+                            faltan = _numeros_de_texto(
+                                afirmacion
+                            ) - _numeros_de_texto(evidencia_limpia)
+                            if faltan:
+                                motivo_rechazo = (
+                                    "La evidencia no contiene todas las cifras de "
+                                    "la afirmación: "
+                                    + ", ".join(sorted(faltan))
+                                    + "."
+                                )
+                    else:
+                        motivo_rechazo = (
+                            "El modelo no proporcionó una cita literal más larga "
+                            "que cubriera todas las cifras."
+                        )
+                else:
+                    motivo_rechazo = (
+                        "La evidencia no contiene todas las cifras de la "
+                        "afirmación y se superó el límite de llamadas: "
+                        + ", ".join(sorted(faltan))
+                        + "."
+                    )
 
         if motivo_rechazo:
             resultado["afirmaciones"].append(

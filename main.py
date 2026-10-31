@@ -71,9 +71,10 @@ PEDIR_ESPERA_BASE = 2.0
 GROQ_MODEL_POR_DEFECTO = "openai/gpt-oss-120b"
 GROQ_LOTE = 15
 GROQ_MINIMO = 4
-GROQ_MAX_REINTENTOS = 4
+GROQ_MAX_REINTENTOS = 3
 GROQ_ESPERA_ENTRE_LOTES = 2.0
 GROQ_ESPERA_BASE = 2.0
+MAX_ESPERA_RATE_LIMIT = 120.0
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -136,6 +137,7 @@ class Item:
     puntuacion_groq: int | None = None
     motivo: str = ""
     solo_titular: bool = False
+    verificacion: dict | None = None
 
 
 @dataclass
@@ -190,15 +192,96 @@ def recortar_texto(texto: str, max_len: int = MAX_CARACTERES) -> str:
     return texto[:max_len].rstrip()
 
 
+_ABREVIATURAS_FIN_FRASE = {
+    "abr",
+    "ago",
+    "aprox",
+    "art",
+    "av",
+    "cap",
+    "cf",
+    "d",
+    "dic",
+    "dr",
+    "dra",
+    "ej",
+    "ene",
+    "etc",
+    "feb",
+    "fig",
+    "figs",
+    "jul",
+    "jun",
+    "mar",
+    "may",
+    "mr",
+    "mrs",
+    "ms",
+    "no",
+    "nov",
+    "num",
+    "oct",
+    "p",
+    "pp",
+    "sept",
+    "sep",
+    "sr",
+    "sra",
+    "srta",
+    "st",
+    "tel",
+    "ud",
+    "uds",
+    "vds",
+    "vol",
+    "vs",
+}
+
+
+def _termina_en_abreviatura(fragmento: str) -> bool:
+    texto = (fragmento or "").rstrip().strip("\"'”’»")
+    if not texto.endswith("."):
+        return False
+    if re.search(r"(?:\b[a-záéíóúüñ]\.){2,}$", texto, re.IGNORECASE):
+        return True
+    coincidencia = re.search(r"([a-záéíóúüñ]+)\.$", texto, re.IGNORECASE)
+    if coincidencia:
+        return coincidencia.group(1).lower() in _ABREVIATURAS_FIN_FRASE
+    return bool(re.search(r"\b[a-záéíóúüñ]\.$", texto, re.IGNORECASE))
+
+
+def dividir_frases(texto: str) -> list[str]:
+    """Divide en frases sin cortar tras abreviaturas como Oct., U.S. o Dr."""
+    if not texto:
+        return []
+    partes = re.split(r"(?<=[.!?])\s+", texto)
+    frases: list[str] = []
+    for parte in partes:
+        if frases and _termina_en_abreviatura(frases[-1]):
+            frases[-1] = frases[-1].rstrip() + " " + parte.lstrip()
+        else:
+            frases.append(parte)
+    return frases
+
+
+def _ultimo_fin_frase(texto: str) -> int | None:
+    ultimo: int | None = None
+    for coincidencia in re.finditer(r"[.!?](?=\s|$)", texto):
+        if coincidencia.group() == "." and _termina_en_abreviatura(
+            texto[: coincidencia.end()]
+        ):
+            continue
+        ultimo = coincidencia.end()
+    return ultimo
+
+
 def recortar_en_frase(texto: str, max_len: int = MAX_CARACTERES) -> str:
     """Recorta en el último punto final anterior al límite (no a mitad de frase)."""
     texto = (texto or "").strip()
     if len(texto) <= max_len:
         return texto
     fragmento = texto[:max_len]
-    ultimo = None
-    for coincidencia in re.finditer(r"[.!?](?=\s|$)", fragmento):
-        ultimo = coincidencia.end()
+    ultimo = _ultimo_fin_frase(fragmento)
     if ultimo:
         return fragmento[:ultimo].strip()
     return fragmento.strip()
@@ -208,7 +291,7 @@ def limpiar_youtube(texto: str) -> str:
     """Quita las URLs y deja las 3 primeras frases de la descripción."""
     texto = re.sub(r"https?://\S+", " ", limpiar_html(texto))
     texto = re.sub(r"\s+", " ", texto).strip()
-    frases = re.split(r"(?<=[.!?])\s+", texto)
+    frases = dividir_frases(texto)
     return " ".join(frases[:3]).strip()
 
 
@@ -335,6 +418,46 @@ def dentro_de_ventana(item: Item, limite: datetime) -> bool:
     return item.fecha >= limite
 
 
+def _espera_indicada_respuesta(respuesta: requests.Response) -> float | None:
+    valor = respuesta.headers.get("Retry-After")
+    if not valor:
+        return None
+    try:
+        return max(0.0, min(MAX_ESPERA_RATE_LIMIT, float(str(valor).strip())))
+    except ValueError:
+        return None
+
+
+def _espera_indicada_error(error: Exception) -> float | None:
+    respuesta = getattr(error, "response", None)
+    if respuesta is not None:
+        espera = _espera_indicada_respuesta(respuesta)
+        if espera is not None:
+            return espera
+    texto = str(error)
+    patrones = (
+        r"retry[- ]after[^\d]{0,20}(\d+(?:[.,]\d+)?)\s*(ms|s|m)?",
+        r"(?:try again|intenta(?:r)? de nuevo|reintenta)[^\d]{0,40}"
+        r"(\d+(?:[.,]\d+)?)\s*(ms|s|m)?",
+        r"(?:in|en)\s+(\d+(?:[.,]\d+)?)\s*(ms|s|segundos?|m|minutos?)",
+    )
+    for patron in patrones:
+        coincidencia = re.search(patron, texto, re.IGNORECASE)
+        if not coincidencia:
+            continue
+        try:
+            cantidad = float(coincidencia.group(1).replace(",", "."))
+        except ValueError:
+            continue
+        unidad = (coincidencia.group(2) or "s").lower()
+        if unidad == "ms":
+            cantidad /= 1000.0
+        elif unidad in ("m", "minuto", "minutos"):
+            cantidad *= 60.0
+        return max(0.0, min(MAX_ESPERA_RATE_LIMIT, cantidad))
+    return None
+
+
 def pedir(session: requests.Session, url: str, params: dict | None = None) -> bytes:
     """GET con reintentos y espera creciente ante errores 429 y 5xx."""
     demora = PEDIR_ESPERA_BASE
@@ -343,7 +466,12 @@ def pedir(session: requests.Session, url: str, params: dict | None = None) -> by
         if (respuesta.status_code == 429 or respuesta.status_code >= 500) and (
             intento < PEDIR_MAX_INTENTOS
         ):
-            time.sleep(demora)
+            espera = demora
+            if respuesta.status_code == 429:
+                indicada = _espera_indicada_respuesta(respuesta)
+                if indicada is not None:
+                    espera = indicada
+            time.sleep(espera)
             demora *= 2
             continue
         respuesta.raise_for_status()
@@ -445,19 +573,30 @@ def _evaluar_lote(cliente, modelo: str, lote: list[tuple[int, Item]]) -> dict[in
 
 def _evaluar_lote_con_reintentos(cliente, modelo: str, lote: list[tuple[int, Item]]):
     espera = GROQ_ESPERA_BASE
-    for intento in range(1, GROQ_MAX_REINTENTOS + 1):
+    for intento in range(GROQ_MAX_REINTENTOS + 1):
         try:
             return _evaluar_lote(cliente, modelo, lote)
-        except RateLimitError:
-            print(f"     429, reintento {intento}/{GROQ_MAX_REINTENTOS} en {espera:.0f}s")
+        except RateLimitError as exc:
+            if intento >= GROQ_MAX_REINTENTOS:
+                print("     429: se agotaron los reintentos")
+                return None
+            indicada = _espera_indicada_error(exc)
+            if indicada is not None:
+                espera = indicada
+            print(
+                f"     429, reintento {intento + 1}/{GROQ_MAX_REINTENTOS} "
+                f"en {espera:.1f}s"
+            )
         except Exception as exc:  # noqa: BLE001
+            if intento >= GROQ_MAX_REINTENTOS:
+                print(f"     {type(exc).__name__}: se agotaron los reintentos")
+                return None
             print(
                 f"     {type(exc).__name__}, reintento "
-                f"{intento}/{GROQ_MAX_REINTENTOS} en {espera:.0f}s"
+                f"{intento + 1}/{GROQ_MAX_REINTENTOS} en {espera:.1f}s"
             )
-        if intento < GROQ_MAX_REINTENTOS:
-            time.sleep(espera)
-            espera *= 2
+        time.sleep(espera)
+        espera *= 2
     return None
 
 
@@ -844,6 +983,60 @@ def recoger() -> tuple[list[Item], list[Resultado]]:
 # Informe
 # ---------------------------------------------------------------------------
 
+ETIQUETA_RESPALDADO = "✅ respaldado"
+ETIQUETA_PARCIAL = "⚠️ parcial"
+ETIQUETA_CONTRADICHO = "❌ contradicho"
+ETIQUETA_NO_VERIFICADO = "❔ no verificado"
+ETIQUETA_LIMITE_API = "⏳ no se pudo verificar (límite de la API)"
+
+ETIQUETAS_VERIFICACION = (
+    ETIQUETA_RESPALDADO,
+    ETIQUETA_PARCIAL,
+    ETIQUETA_CONTRADICHO,
+    ETIQUETA_NO_VERIFICADO,
+    ETIQUETA_LIMITE_API,
+)
+
+ETIQUETAS_POR_RESPALDO = {
+    "respaldado": ETIQUETA_RESPALDADO,
+    "parcial": ETIQUETA_PARCIAL,
+    "contradicho": ETIQUETA_CONTRADICHO,
+    "no verificado": ETIQUETA_NO_VERIFICADO,
+    "limite_api": ETIQUETA_LIMITE_API,
+}
+
+PRIORIDAD_ETIQUETA = {
+    ETIQUETA_RESPALDADO: 0,
+    ETIQUETA_PARCIAL: 1,
+    ETIQUETA_LIMITE_API: 2,
+    ETIQUETA_NO_VERIFICADO: 3,
+    ETIQUETA_CONTRADICHO: 4,
+}
+
+LEYENDA_ETIQUETAS = (
+    (
+        ETIQUETA_RESPALDADO,
+        "la fuente primaria contiene la afirmación y todas sus cifras.",
+    ),
+    (
+        ETIQUETA_PARCIAL,
+        "la fuente respalda solo una parte de la afirmación.",
+    ),
+    (
+        ETIQUETA_CONTRADICHO,
+        "la fuente contradice directamente el núcleo de la afirmación.",
+    ),
+    (
+        ETIQUETA_NO_VERIFICADO,
+        "no se encontró evidencia suficiente en la fuente.",
+    ),
+    (
+        ETIQUETA_LIMITE_API,
+        "la API devolvió error 429 y se agotaron los reintentos; "
+        "no es lo mismo que 'no verificado'.",
+    ),
+)
+
 
 def formatear_fecha(item: Item) -> str:
     if item.fecha is None:
@@ -881,6 +1074,161 @@ def formato_puntuacion(item: Item) -> str:
     return f"{item.puntuacion} (palabras clave)"
 
 
+def etiqueta_afirmacion(afirmacion: dict) -> str:
+    respaldo = str(afirmacion.get("respaldo") or "").strip().lower()
+    return ETIQUETAS_POR_RESPALDO.get(respaldo, ETIQUETA_NO_VERIFICADO)
+
+
+def etiqueta_item(item: Item) -> str:
+    verificacion = item.verificacion or {}
+    afirmaciones = verificacion.get("afirmaciones") or []
+    etiquetas = [
+        etiqueta_afirmacion(af)
+        for af in afirmaciones
+        if isinstance(af, dict)
+    ]
+    if not etiquetas:
+        if verificacion.get("limite_api"):
+            return ETIQUETA_LIMITE_API
+        return ETIQUETA_NO_VERIFICADO
+    return max(etiquetas, key=lambda e: PRIORIDAD_ETIQUETA.get(e, 3))
+
+
+def contar_etiquetas(items: list[Item]) -> dict[str, int]:
+    conteo = {etiqueta: 0 for etiqueta in ETIQUETAS_VERIFICACION}
+    for item in items:
+        conteo[etiqueta_item(item)] += 1
+    return conteo
+
+
+def _urls_iguales(url_a: str, url_b: str) -> bool:
+    if not url_a or not url_b:
+        return False
+
+    def normalizar(url: str) -> tuple[str, str, str]:
+        parsed = urlparse(url.strip())
+        dominio = (parsed.netloc or "").lower()
+        if dominio.startswith("www."):
+            dominio = dominio[4:]
+        ruta = (parsed.path or "").rstrip("/")
+        return dominio, ruta, parsed.query or ""
+
+    return normalizar(url_a) == normalizar(url_b)
+
+
+def render_leyenda_verificacion() -> list[str]:
+    lineas = ["## Leyenda de etiquetas", ""]
+    for etiqueta, descripcion in LEYENDA_ETIQUETAS:
+        lineas.append(f"- {etiqueta}: {descripcion}")
+    lineas.append("")
+    return lineas
+
+
+def render_verificacion(item: Item) -> list[str]:
+    if item.verificacion is None:
+        if item.solo_titular:
+            return []
+        return [
+            f"- **Verificación:** {ETIQUETA_NO_VERIFICADO}",
+            "- **Motivo:** No se ejecutó la verificación.",
+        ]
+
+    lineas = [f"- **Verificación:** {etiqueta_item(item)}"]
+    afirmaciones = item.verificacion.get("afirmaciones") or []
+    if not afirmaciones:
+        errores = item.verificacion.get("errores") or []
+        motivo = (
+            str(errores[0]).strip()
+            if errores
+            else "No se pudo verificar la noticia."
+        )
+        lineas.append(f"- **Motivo:** {motivo}")
+        return lineas
+
+    for af in afirmaciones:
+        if not isinstance(af, dict):
+            continue
+        etiqueta = etiqueta_afirmacion(af)
+        texto = str(af.get("texto") or "").strip()
+        lineas.append(f"  - {etiqueta}: {texto}" if texto else f"  - {etiqueta}")
+
+        fuente = str(af.get("fuente_primaria_url") or "").strip()
+        if fuente:
+            enlace_noticia = (item.enlace_real or item.enlace or "").strip()
+            if _urls_iguales(fuente, enlace_noticia):
+                lineas.append(
+                    "    - Fuente primaria: verificado contra el propio artículo"
+                )
+            else:
+                lineas.append(f"    - Fuente primaria: {fuente}")
+
+        evidencia = str(af.get("evidencia") or "").strip()
+        if evidencia:
+            lineas.append(f'    - Evidencia: "{evidencia}"')
+
+        explicacion = str(af.get("explicacion_parcial") or "").strip()
+        if explicacion:
+            lineas.append(f"    - Explicación: {explicacion}")
+
+        motivo = str(af.get("motivo_rechazo") or "").strip()
+        if motivo:
+            lineas.append(f"    - Motivo: {motivo}")
+
+        matices = af.get("matices_omitidos") or []
+        if matices:
+            lineas.append("    - Matices omitidos:")
+            for matiz in matices:
+                if not isinstance(matiz, dict):
+                    continue
+                texto_matiz = str(
+                    matiz.get("texto") or matiz.get("fragmento_literal") or ""
+                ).strip()
+                por_que = str(matiz.get("por_que_matiza") or "").strip()
+                if texto_matiz and por_que:
+                    lineas.append(f"      - {texto_matiz} ({por_que})")
+                elif texto_matiz:
+                    lineas.append(f"      - {texto_matiz}")
+
+    return lineas
+
+
+def render_resumen_verificacion(items: list[Item]) -> list[str]:
+    conteo = contar_etiquetas(items)
+    lineas = ["## Resumen de verificación", ""]
+    for etiqueta in ETIQUETAS_VERIFICACION:
+        lineas.append(f"- {etiqueta}: {conteo[etiqueta]}")
+    lineas.append(f"- Total: {len(items)}")
+    lineas.append("")
+    return lineas
+
+
+def verificar_items(items: list[Item]) -> None:
+    if not items:
+        return
+    try:
+        from verificar import verificar_item
+    except Exception as exc:  # noqa: BLE001
+        for item in items:
+            item.verificacion = {
+                "afirmaciones": [],
+                "errores": [
+                    f"No se pudo importar verificar: {type(exc).__name__}: {exc}"
+                ],
+            }
+        return
+
+    total = len(items)
+    for indice, item in enumerate(items, 1):
+        print(f"  Verificando {indice}/{total}: {item.titulo[:70]}")
+        try:
+            item.verificacion = verificar_item(item)
+        except Exception as exc:  # noqa: BLE001
+            item.verificacion = {
+                "afirmaciones": [],
+                "errores": [f"{type(exc).__name__}: {exc}"],
+            }
+
+
 def render_seccion(titulo: str, items: list[Item]) -> list[str]:
     lineas = [f"## {titulo}", ""]
     if not items:
@@ -894,6 +1242,8 @@ def render_seccion(titulo: str, items: list[Item]) -> list[str]:
         lineas.append(f"- Puntuación: {formato_puntuacion(item)}")
         lineas.append("")
         lineas.append(cuerpo_item(item))
+        lineas.append("")
+        lineas += render_verificacion(item)
         lineas.append("")
     return lineas
 
@@ -946,6 +1296,9 @@ def _cuerpo_informe_principal(
     noticias, investigacion, videos = clasificar(con_texto)
 
     lineas: list[str] = [f"# Informe de IA y Educación - {ahora.strftime('%Y-%m-%d')}", ""]
+
+    lineas += render_leyenda_verificacion()
+    lineas += render_resumen_verificacion(con_texto)
 
     lineas += ["## Índice", ""]
     lineas.append(f"- Noticias: {len(noticias)}")
@@ -1028,6 +1381,25 @@ def main() -> int:
     items = deduplicar_videos(items)
     exitos = sum(1 for item in items if not item.solo_titular)
     imprimir_tabla_textos(items, "Textos reales extraídos por fuente")
+    items_con_texto = [item for item in items if not item.solo_titular]
+    try:
+        verificar_items(items_con_texto)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  Aviso: fallo global de verificación: {type(exc).__name__}: {exc}")
+        for item in items_con_texto:
+            if item.verificacion is None:
+                item.verificacion = {
+                    "afirmaciones": [],
+                    "errores": [f"{type(exc).__name__}: {exc}"],
+                }
+    conteo_verificacion = contar_etiquetas(items_con_texto)
+    print(
+        "  Verificación: "
+        + ", ".join(
+            f"{etiqueta}: {conteo_verificacion[etiqueta]}"
+            for etiqueta in ETIQUETAS_VERIFICACION
+        )
+    )
     ruta_principal, ruta_titulares = generar_informes(items)
     resumen_consola_final(
         items, resultados, ruta_principal, ruta_titulares, exitos
